@@ -1,0 +1,316 @@
+name: Madeira IPA bauen
+
+# Nimmt die offizielle Madeira-IPA (github.com/willfaust/Madeira) und ersetzt
+# einzelne Windows-Dateien durch gepatchte Neubauten aus genau den Quellen,
+# die das jeweilige Madeira-Release festschreibt:
+#   ntdll.dll    (Wine, patches/wine/)          -> arm64ec-windows/ntdll.dll
+#   xtajit64.dll (FEX, patches/fex/)            -> arm64ec-windows/xtajit64.dll
+#   dockhost.exe (madeira-dock, patches/madeira-dock/) -> arm64ec-windows/dockhost.exe
+# und legt die Microsoft Visual C++ Runtime (x64) in Madeira.app/x86_64-vcruntime/.
+# Alles läuft auf Linux/Windows-Runnern, kein Mac nötig. Die IPA ist unsigniert:
+# in Feather oder SideStore importieren, dort wird signiert.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # täglich: neues Madeira-Release oder neue Patches?
+  push:
+    branches: [ main ]
+    paths: [ "patches/**", ".github/workflows/build.yml", "CHANGELOG.md" ]
+  workflow_dispatch:
+    inputs:
+      madeira_tag:
+        description: "Madeira-Release-Tag (leer = neuestes)"
+        default: ""
+      force:
+        description: "Neu bauen, auch wenn das Release schon existiert"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  LLVM_MINGW: "20260421"   # wie in Madeiras docs/BUILDING.md
+
+jobs:
+  check:
+    name: Was bauen?
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.c.outputs.tag }}
+      release: ${{ steps.c.outputs.release }}
+      build: ${{ steps.c.outputs.build }}
+      wine: ${{ steps.c.outputs.wine }}
+      fex: ${{ steps.c.outputs.fex }}
+      dock: ${{ steps.c.outputs.dock }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.madeira_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          TAG=$(gh release view $TAG -R willfaust/Madeira --json tagName -q .tagName)
+          sub() { gh api "repos/willfaust/Madeira/contents/$1?ref=$TAG" -q .sha; }
+          WINE=$(sub wine); FEX=$(sub FEX); DOCK=$(sub madeira-dock)
+          # Release-Name ändert sich mit jedem neuen Madeira-Tag und jeder Patch-Änderung
+          PH=$(git rev-parse --short=8 HEAD:patches)
+          REL="madeira-$TAG-fix-$PH"
+          printf 'Madeira %s\n  wine %s\n  FEX  %s\n  dock %s\n  Release %s\n' "$TAG" "$WINE" "$FEX" "$DOCK" "$REL"
+          { echo "tag=$TAG"; echo "release=$REL"; echo "wine=$WINE"; echo "fex=$FEX"; echo "dock=$DOCK"; } >> $GITHUB_OUTPUT
+          if gh release view "$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            echo "Release $REL existiert schon, nichts zu tun"; echo "build=false" >> $GITHUB_OUTPUT
+          else
+            echo "build=true" >> $GITHUB_OUTPUT
+          fi
+
+  vcruntime:
+    name: VC++ Runtime (Windows)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: VC++ 2015-2022 x64 Runtime installieren
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+          $p = Start-Process .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+          # 0 = ok, 1638 = neuere Version schon installiert, 3010 = Neustart nötig
+          if ($p.ExitCode -notin 0,1638,3010) { throw "vc_redist ExitCode $($p.ExitCode)" }
+      - name: 12 DLLs unverändert aus System32 kopieren
+        shell: pwsh
+        run: |
+          $dlls = 'concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll',
+                  'msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcamp140.dll',
+                  'vccorlib140.dll','vcomp140.dll','vcruntime140.dll','vcruntime140_1.dll',
+                  'vcruntime140_threads.dll'
+          New-Item -ItemType Directory x86_64-vcruntime | Out-Null
+          foreach ($d in $dlls) {
+            Copy-Item "$env:WINDIR\System32\$d" x86_64-vcruntime\ -ErrorAction Stop
+            $sig = Get-AuthenticodeSignature "x86_64-vcruntime\$d"
+            if ($sig.Status -ne 'Valid') { throw "${d}: Signatur $($sig.Status)" }
+            "{0,-28} {1,-14} {2}" -f $d, (Get-Item "x86_64-vcruntime\$d").VersionInfo.FileVersion, $sig.Status
+          }
+          (Get-Item x86_64-vcruntime\vcruntime140_1.dll).VersionInfo.FileVersion | Out-File -NoNewline x86_64-vcruntime\VERSION.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: vcruntime, path: x86_64-vcruntime/, retention-days: 1 }
+
+  ntdll:
+    name: ntdll.dll (Wine ARM64EC)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check.outputs.tag }}
+      WINE_SHA: ${{ needs.check.outputs.wine }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: self }
+      - name: Werkzeuge + llvm-mingw
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq flex bison >/dev/null
+          gh release download "$LLVM_MINGW" -R mstorsjo/llvm-mingw \
+            --pattern "llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar xf llvm-mingw-*.tar.xz
+          echo "$PWD/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64/bin" >> $GITHUB_PATH
+      - name: Madeira (build/) + Wine-Commit des Releases holen
+        run: |
+          # Wine bindet Header aus Madeiras build/ ein (../../../../build/...),
+          # deshalb liegt der Wine-Baum wie im Original unter madeira/wine.
+          git init -q madeira && cd madeira
+          git remote add origin https://github.com/willfaust/Madeira.git
+          git sparse-checkout set --no-cone /build/ /app/Madeira/arm64ec-windows/ntdll.dll
+          git fetch -q --depth 1 --filter=blob:none origin "refs/tags/$TAG" && git checkout -q FETCH_HEAD
+          git init -q wine && cd wine
+          git remote add origin https://github.com/willfaust/wine.git
+          git fetch -q --depth 1 origin "$WINE_SHA" && git checkout -q FETCH_HEAD
+          git log --oneline -1
+      - name: Konfigurieren (wie build/wine-pe/build-ntdll.sh)
+        run: |
+          mkdir madeira/wine/build-arm64ec && cd madeira/wine/build-arm64ec
+          ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer > configure.log 2>&1 \
+            || { tail -50 configure.log; exit 1; }
+      - name: Ungepatcht bauen und mit dem Original vergleichen
+        run: |
+          cd madeira/wine/build-arm64ec
+          make -j"$(nproc)" dlls/ntdll/arm64ec-windows/ntdll.dll > build.log 2>&1 || { tail -50 build.log; exit 1; }
+          cp dlls/ntdll/arm64ec-windows/ntdll.dll $GITHUB_WORKSPACE/plain.dll
+          arm64ec-w64-mingw32-strip $GITHUB_WORKSPACE/plain.dll
+          python3 $GITHUB_WORKSPACE/self/tools/pe-compare.py \
+            $GITHUB_WORKSPACE/madeira/app/Madeira/arm64ec-windows/ntdll.dll $GITHUB_WORKSPACE/plain.dll --expect-identical
+      - name: Patches anwenden + neu bauen
+        run: |
+          cd madeira/wine
+          for p in $GITHUB_WORKSPACE/self/patches/wine/*.patch; do echo "Patch: $p"; git apply --verbose "$p"; done
+          cd build-arm64ec
+          make -j"$(nproc)" dlls/ntdll/arm64ec-windows/ntdll.dll > build2.log 2>&1 || { tail -50 build2.log; exit 1; }
+          mkdir -p $GITHUB_WORKSPACE/out
+          cp dlls/ntdll/arm64ec-windows/ntdll.dll $GITHUB_WORKSPACE/out/ntdll.dll
+          arm64ec-w64-mingw32-strip $GITHUB_WORKSPACE/out/ntdll.dll
+          python3 $GITHUB_WORKSPACE/self/tools/pe-compare.py \
+            $GITHUB_WORKSPACE/madeira/app/Madeira/arm64ec-windows/ntdll.dll $GITHUB_WORKSPACE/out/ntdll.dll
+      - name: Auf SizeOfImage + 0x50000 auffüllen (wie build-ntdll.sh)
+        run: |
+          python3 self/tools/pad-ntdll.py out/ntdll.dll
+          ls -l out/ntdll.dll madeira/app/Madeira/arm64ec-windows/ntdll.dll
+          test "$(stat -c %s out/ntdll.dll)" = "$(stat -c %s madeira/app/Madeira/arm64ec-windows/ntdll.dll)"
+      - uses: actions/upload-artifact@v4
+        with: { name: ntdll, path: out/ntdll.dll, retention-days: 7 }
+
+  fex:
+    name: xtajit64.dll (FEX ARM64EC)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FEX_SHA: ${{ needs.check.outputs.fex }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: self }
+      - name: FEX + Submodule holen
+        run: |
+          git init -q fex && cd fex
+          git remote add origin https://github.com/willfaust/FEX.git
+          git fetch -q --depth 1 origin "$FEX_SHA" && git checkout -q FETCH_HEAD
+          for p in External/fex-posixtest-bins External/fex-gvisor-tests-bins External/fex-gcc-target-tests-bins External/Catch2; do
+            git config "submodule.$p.update" none
+          done
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - name: Patches anwenden
+        run: |
+          shopt -s nullglob
+          for p in self/patches/fex/*.patch; do echo "Patch: $p"; git -C fex apply --verbose "$GITHUB_WORKSPACE/$p"; done
+      - name: llvm-mingw + ninja
+        run: |
+          sudo apt-get install -y -qq ninja-build >/dev/null
+          gh release download "$LLVM_MINGW" -R mstorsjo/llvm-mingw \
+            --pattern "llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar xf llvm-mingw-*.tar.xz
+          echo "$PWD/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64/bin" >> $GITHUB_PATH
+      - name: Konfigurieren (Optionen wie build/fex-arm64ec/build.sh)
+        run: |
+          # ENABLE_LTO=OFF: mit LTO fehlen beim Linken EC-Symbole aus libc++
+          cmake -S fex -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/fex/Data/CMake/toolchain_mingw.cmake" \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DFEX_IOS_HOST_BUILD=ON -DCMAKE_C_FLAGS=-DFEX_IOS_HOST \
+            -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_LTO=OFF \
+            -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON -DENABLE_OFFLINE_RUNTIME=ON \
+            -DBUILD_FEXCONFIG=ON -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=OFF \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_ASSERTIONS=OFF
+      - name: Bauen
+        run: |
+          cmake --build build --target arm64ecfex -j"$(nproc)"
+          mkdir out && cp build/Bin/libarm64ecfex.dll out/xtajit64.dll
+          llvm-readobj --coff-exports out/xtajit64.dll | grep -c Name:
+      - uses: actions/upload-artifact@v4
+        with: { name: xtajit64, path: out/xtajit64.dll, retention-days: 7 }
+
+  dock:
+    name: dockhost.exe (Madeira Dock)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOCK_SHA: ${{ needs.check.outputs.dock }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: self }
+      - name: madeira-dock holen + patchen
+        run: |
+          git init -q dock && cd dock
+          git remote add origin https://github.com/willfaust/madeira-dock
+          git fetch -q --depth 1 origin "$DOCK_SHA" && git checkout -q FETCH_HEAD
+          shopt -s nullglob
+          for p in ../self/patches/madeira-dock/*.patch; do git apply --verbose "$p"; done
+      - name: Unit-Tests von madeira-dock
+        run: cd dock && HOST_CC=clang bash tools/check.sh
+      - name: llvm-mingw
+        run: |
+          gh release download "$LLVM_MINGW" -R mstorsjo/llvm-mingw \
+            --pattern "llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar xf llvm-mingw-*.tar.xz
+          echo "$PWD/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64/bin" >> $GITHUB_PATH
+      - name: dockhost.exe bauen (Flags wie build/madeira-dock/build.sh)
+        run: |
+          mkdir out
+          x86_64-w64-mingw32-clang -std=c11 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
+            -static -Wl,--strip-all -Wl,--no-insert-timestamp \
+            -o out/dockhost.exe dock/src/*.c -ladvapi32
+          section() { printf '\n\n==== %s ====\n\n' "$1"; }
+          {
+            cat dock/LICENSE
+            printf '\nCorresponding source: https://github.com/willfaust/madeira-dock (commit %s)\n' "$(git -C dock rev-parse HEAD)"
+            printf 'with the patches in patches/madeira-dock/ of https://github.com/%s\n' "$GITHUB_REPOSITORY"
+            section 'LICENSE-EXCEPTION.md (Madeira Converter Exception)'; cat dock/LICENSE-EXCEPTION.md
+            section 'COPYING (GNU General Public License, version 3)'; cat dock/COPYING
+            section 'MinGW-w64 runtime notice (statically linked runtime)'; cat dock/notices/MinGW-w64-runtime.txt
+            section 'LLVM runtime notice'; cat dock/notices/LLVM.txt
+          } > out/dock-notices.txt
+          sha256sum out/dockhost.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: dockhost, path: out/, retention-days: 7 }
+
+  ipa:
+    name: IPA + Release
+    needs: [check, vcruntime, ntdll, fex, dock]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check.outputs.tag }}
+      REL: ${{ needs.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offizielle Madeira-IPA herunterladen
+        run: |
+          gh release download "$TAG" -R willfaust/Madeira --pattern '*.ipa' --dir in
+          test "$(ls in/*.ipa | wc -l)" = 1
+      - uses: actions/download-artifact@v4
+        with: { path: art }
+      - name: VC++-DLLs prüfen (müssen unverändert und signiert sein)
+        run: |
+          echo "VCRT_VERSION=$(cat art/vcruntime/VERSION.txt)" >> $GITHUB_ENV
+          rm art/vcruntime/VERSION.txt
+          test "$(ls art/vcruntime/*.dll | wc -l)" = 12
+          python3 tools/check-signed-x64.py art/vcruntime/*.dll
+      - name: Dateien in die IPA einsetzen
+        run: |
+          IPA=$(ls in/*.ipa)
+          APP=$(unzip -Z1 "$IPA" | grep -m1 -oE '^Payload/[^/]+\.app/')
+          OUT="Madeira-$TAG-fix.ipa"
+          cp "$IPA" "$OUT"
+          W="stage/${APP}arm64ec-windows"
+          mkdir -p "$W" "stage/${APP}x86_64-vcruntime"
+          # ersetzt werden nur Dateien, die es im Original schon gibt
+          for f in ntdll.dll xtajit64.dll dockhost.exe; do unzip -l "$IPA" "${APP}arm64ec-windows/$f" >/dev/null; done
+          cp art/ntdll/ntdll.dll art/xtajit64/xtajit64.dll art/dockhost/dockhost.exe art/dockhost/dock-notices.txt "$W/"
+          cp art/vcruntime/*.dll "stage/${APP}x86_64-vcruntime/"
+          # nur anhängen: alle anderen Bytes des Archivs bleiben wie im Original
+          (cd stage && zip -q -r "../$OUT" Payload)
+          for f in ntdll.dll xtajit64.dll dockhost.exe; do
+            unzip -p "$OUT" "${APP}arm64ec-windows/$f" | cmp - "$W/$f" && echo "ok  $f"
+          done
+          unzip -l "$OUT" | grep -c "x86_64-vcruntime/.*\.dll"
+          echo "OUT=$OUT" >> $GITHUB_ENV
+      - name: Release anlegen
+        run: |
+          {
+            echo "Basis: Madeira $TAG (https://github.com/willfaust/Madeira/releases/tag/$TAG)"
+            echo "wine ${{ needs.check.outputs.wine }} · FEX ${{ needs.check.outputs.fex }} · dock ${{ needs.check.outputs.dock }}"
+            echo "VC++ Runtime $VCRT_VERSION · Build $GITHUB_SHA"
+            echo
+            sed '1,/^## /{/^## /!d}' CHANGELOG.md
+          } > notes.md
+          if gh release view "$REL" >/dev/null 2>&1; then
+            gh release upload "$REL" "$OUT" --clobber
+            gh release edit "$REL" --notes-file notes.md
+          else
+            gh release create "$REL" "$OUT" --prerelease --target "$GITHUB_SHA" \
+              --title "Madeira $TAG – Fixes (${REL##*-})" --notes-file notes.md
+          fi
+          gh release view "$REL" --json url -q .url

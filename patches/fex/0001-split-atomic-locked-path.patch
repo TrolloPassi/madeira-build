@@ -1,0 +1,269 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 094e6f4..99b9330 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -10,6 +10,61 @@ $end_info$
+ #include "Interface/Core/JIT/JITClass.h"
+ 
+ namespace FEXCore::CPU {
++#ifdef ARCHITECTURE_arm64ec
++// Madeira split-atomic patch: an x86 locked access whose operand crosses a
++// 16-byte boundary faults as an LSE atomic on the host. FEX emulates it in the
++// SIGBUS/Mach path but never backpatches LSE atomics, so a hot site pays a full
++// exception round trip on every execution (Minecraft Dungeons: ~800k at one
++// site). Instead, check the address inline (no NZCV change) and run crossing
++// accesses under one process-wide lock with plain loads and stores.
++alignas(64) static uint32_t MadeiraSplitAtomicLock = 0;
++enum class SplitAtomicOp { CAS, Swap, Add, Sub, And, Clr, Or, Xor, Neg };
++
++#define MADEIRA_SPLIT_CHECK(MemSrc, Bytes, SlowLabel)                         \
++  const bool SplitCheck = (Bytes) > 1;                                         \
++  if (SplitCheck) {                                                            \
++    /* TMP1 = (addr & 15) + Bytes - 17: >= 0 iff the access crosses 16B */     \
++    and_(ARMEmitter::Size::i64Bit, TMP1, MemSrc, uint64_t {15});                        \
++    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, uint32_t(17 - (Bytes)));                 \
++    (void)tbz(TMP1, 63, SlowLabel);                                            \
++  }
++
++#define MADEIRA_SPLIT_SLOW(Kind, MemSrc, SubEmitSize, EmitSize, Bytes, Value, Desired, Dst) \
++  do {                                                                         \
++    dmb(ARMEmitter::BarrierScope::ISH);                                        \
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, reinterpret_cast<uint64_t>(&MadeiraSplitAtomicLock)); \
++    ARMEmitter::BackwardLabel LockRetry;                                       \
++    (void)Bind(&LockRetry);                                                    \
++    ldaxr(TMP2.W(), TMP1);                                                     \
++    (void)cbnz(ARMEmitter::Size::i32Bit, TMP2, &LockRetry);                    \
++    movz(ARMEmitter::Size::i32Bit, TMP2, 1);                                   \
++    stxr(TMP3.W(), TMP2.W(), TMP1);                                            \
++    (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LockRetry);                    \
++    ldr(SubEmitSize, TMP2, MemSrc);                                            \
++    ARMEmitter::ForwardLabel NoStore;                                          \
++    switch (Kind) {                                                            \
++    case SplitAtomicOp::CAS:                                                   \
++      eor((Bytes) == 8 ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit, TMP3, TMP2, Value); \
++      if ((Bytes) == 2) and_(ARMEmitter::Size::i32Bit, TMP3, TMP3, uint64_t {0xFFFF});    \
++      (void)cbnz((Bytes) == 8 ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit, TMP3, &NoStore); \
++      str(SubEmitSize, Desired, MemSrc);                                       \
++      break;                                                                   \
++    case SplitAtomicOp::Swap: str(SubEmitSize, Value, MemSrc); break;          \
++    case SplitAtomicOp::Add: add(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::Sub: sub(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::And: and_(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::Clr: bic(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::Or: orr(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::Xor: eor(EmitSize, TMP3, TMP2, Value); str(SubEmitSize, TMP3, MemSrc); break; \
++    case SplitAtomicOp::Neg: neg(EmitSize, TMP3, TMP2); str(SubEmitSize, TMP3, MemSrc); break; \
++    }                                                                          \
++    (void)Bind(&NoStore);                                                      \
++    stlr(ARMEmitter::WReg::zr, TMP1);                                          \
++    dmb(ARMEmitter::BarrierScope::ISH);                                        \
++    mov(EmitSize, Dst, TMP2.R());                                              \
++  } while (0)
++#endif
++
+ // Guest window: every address here is a guest address and is converted once, up front, into the reserved
+ // REG_GUEST_ADDR_TMP (see Arm64Emitter.h). Using a reserved register rather than one of TMP1-TMP4 is
+ // deliberate and load-bearing for exactly this file: CASPair and the LL/SC loops below park values
+@@ -111,6 +166,11 @@ DEF_OP(CAS) {
+   auto Dst = GetReg(Node);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
+       casal(SubEmitSize, Dst, Desired, MemSrc);
+     } else {
+@@ -118,6 +178,14 @@ DEF_OP(CAS) {
+       casal(SubEmitSize, TMP2, Desired, MemSrc);
+       mov(EmitSize, Dst, TMP2.R());
+     }
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::CAS, MemSrc, SubEmitSize, EmitSize, Bytes, Expected, Desired, Dst);
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     ARMEmitter::ForwardLabel LoopNotExpected;
+@@ -164,7 +232,20 @@ DEF_OP(AtomicSwap) {
+                                                           ARMEmitter::SubRegSize::i8Bit;
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(OpSize);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Swap, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -184,7 +265,20 @@ DEF_OP(AtomicFetchAdd) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     ldaddal(SubEmitSize, Src, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Add, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -205,8 +299,21 @@ DEF_OP(AtomicFetchSub) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     neg(EmitSize, TMP2, Src);
+     ldaddal(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Sub, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -227,8 +334,21 @@ DEF_OP(AtomicFetchAnd) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     mvn(EmitSize, TMP2, Src);
+     ldclral(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::And, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -249,7 +369,20 @@ DEF_OP(AtomicFetchCLR) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     ldclral(SubEmitSize, Src, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Clr, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -270,7 +403,20 @@ DEF_OP(AtomicFetchOr) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     ldsetal(SubEmitSize, Src, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Or, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -291,7 +437,20 @@ DEF_OP(AtomicFetchXor) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     ldeoral(SubEmitSize, Src, GetReg(Node), MemSrc);
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Xor, MemSrc, SubEmitSize, EmitSize, Bytes, Src, Src, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -311,6 +470,11 @@ DEF_OP(AtomicFetchNeg) {
+   auto MemSrc = GetGuestMemReg(Op->Addr);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++#ifdef ARCHITECTURE_arm64ec
++    const uint32_t Bytes = IR::OpSizeToSize(IROp->Size);
++    ARMEmitter::ForwardLabel SplitSlow, SplitDone;
++    MADEIRA_SPLIT_CHECK(MemSrc, Bytes, &SplitSlow);
++#endif
+     // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
+     ldr(SubEmitSize, TMP2, MemSrc);
+     ARMEmitter::BackwardLabel LoopTop;
+@@ -321,6 +485,14 @@ DEF_OP(AtomicFetchNeg) {
+     sub(EmitSize, TMP3, TMP2, TMP4);
+     (void)cbnz(EmitSize, TMP3, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
++#ifdef ARCHITECTURE_arm64ec
++    if (SplitCheck) {
++      (void)b(&SplitDone);
++      (void)Bind(&SplitSlow);
++      MADEIRA_SPLIT_SLOW(SplitAtomicOp::Neg, MemSrc, SubEmitSize, EmitSize, Bytes, TMP2, TMP2, GetReg(Node));
++      (void)Bind(&SplitDone);
++    }
++#endif
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);

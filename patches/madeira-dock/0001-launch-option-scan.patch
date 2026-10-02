@@ -1,0 +1,87 @@
+diff --git a/src/launch.c b/src/launch.c
+index 339f3d8..92bad35 100644
+--- a/src/launch.c
++++ b/src/launch.c
+@@ -17,6 +17,12 @@
+ #define SH_CONFIG_RETRY_MS 5000
+ #define SH_SESSION_WAIT_MS (3ULL * 60 * 1000)  /* ml2015 */
+ #define SH_SESSION_RETRY_MS 15000
++/* Steam keys an app's launch entries by number ("0", "1", ...). LaunchApp
++ * with option 0 fails with 22 (invalid app config) for an app that has no
++ * entry "0" (PEAK, app 3527290, only has 5, 6, 8 and 9). The host then asks
++ * for the next numbers until Valve's client accepts one.
++ */
++#define SH_LAUNCH_OPTION_MAX 31
+ 
+ #ifdef _WIN64
+ typedef void *(__thiscall *get_manager_fn)(void *, int32_t, int32_t);
+@@ -230,7 +236,32 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+     o->event("launch-client-discovery-published", 1);
+     SetConsoleCtrlHandler(on_control, TRUE);
+     uint64_t gameid = appid;
+-    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, 0, 0, "");
++    /* MADEIRA_DOCK_LAUNCH_OPTION=<n> asks for launch entry n only (no scan).
++     * MADEIRA_DOCK_LAUNCH_ARGS is passed to Valve's client as user arguments.
++     */
++    uint32_t option = 0;
++    bool option_scan = true;
++    wchar_t option_text[16] = {0};
++    DWORD option_length = GetEnvironmentVariableW(L"MADEIRA_DOCK_LAUNCH_OPTION", option_text, 16);
++    if (option_length && option_length < 16) {
++        wchar_t *end = NULL;
++        unsigned long value = wcstoul(option_text, &end, 10);
++        if (end && end != option_text && !*end && value <= SH_LAUNCH_OPTION_MAX) {
++            option = (uint32_t)value;
++            option_scan = false;
++        }
++    }
++    static wchar_t user_args_wide[1024];
++    static char user_args[4096];
++    user_args[0] = 0;
++    DWORD args_length = GetEnvironmentVariableW(L"MADEIRA_DOCK_LAUNCH_ARGS", user_args_wide, 1024);
++    if (!args_length || args_length >= 1024 ||
++        !WideCharToMultiByte(CP_UTF8, 0, user_args_wide, -1, user_args, sizeof(user_args), NULL, NULL))
++        user_args[0] = 0;
++    o->event("launch-option", (int32_t)option);
++    o->event("launch-option-scan", option_scan);
++    o->event("launch-user-args", user_args[0] != 0);
++    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, option, 0, user_args);
+     o->event("launch-request-submitted", call != 0);
+     if (!call) { result = 43; goto done; }
+     uint64_t begin = o->now_ms(), stopped_at = 0;
+@@ -301,7 +332,14 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+                     result_received = decoded && error == 0;
+                     result_rejected = !result_received;
+                     if (result_received && wait_began) o->event("launch-update-ready", (int32_t)retries);
+-                    if (!result_received && decoded && content_wait && !seen_running &&
++                    if (result_received) o->event("launch-option-accepted", (int32_t)option);
++                    if (!result_received && decoded && option_scan && !seen_running &&
++                        error == 22 && option < SH_LAUNCH_OPTION_MAX) {
++                        ++option;
++                        retry_at = o->now_ms();
++                        result_rejected = false;
++                    }
++                    else if (!result_received && decoded && content_wait && !seen_running &&
+                         sh_launch_error_waits_for_content(error) &&
+                         (!wait_began || o->now_ms() - wait_began < SH_CONTENT_WAIT_MS)) {
+                         if (!wait_began) {
+@@ -318,6 +356,10 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+                             config_began = o->now_ms();
+                             o->event("launch-config-wait", error);
+                         }
++                        /* Every entry was refused: the configuration may not
++                         * have arrived yet, so the next request scans again.
++                         */
++                        if (option_scan) option = 0;
+                         retry_at = o->now_ms() + SH_CONFIG_RETRY_MS;
+                         result_rejected = false;
+                     }
+@@ -356,7 +398,7 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+         }
+         if (retry_at && !seen_running && o->now_ms() >= retry_at) {
+             retry_at = 0;
+-            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, 0, 0, "");
++            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, option, 0, user_args);
+             ++retries;
+             if (retries <= 3 || retries % 60 == 0) o->event("launch-update-retry", (int32_t)retries);
+             if (!call) { result = 43; goto done; }

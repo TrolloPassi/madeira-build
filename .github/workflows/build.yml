@@ -110,7 +110,7 @@ jobs:
         with: { path: self }
       - name: Werkzeuge + llvm-mingw
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq flex bison >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq flex bison libfreetype-dev >/dev/null
           gh release download "$LLVM_MINGW" -R mstorsjo/llvm-mingw \
             --pattern "llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
           tar xf llvm-mingw-*.tar.xz

@@ -1,0 +1,154 @@
+name: Madeira IPA + VC++ Runtime
+
+# Nimmt die offizielle Madeira-IPA (github.com/willfaust/Madeira) und legt
+# Microsofts Visual C++ Runtime (x64) in Madeira.app/x86_64-vcruntime/.
+# Ergebnis: Release "madeira-<tag>-vcruntime" in diesem Repo (sonst unverändert, keine Patches).
+# Kein Mac nötig — signiert wird danach auf dem iPad (Feather / SideStore).
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ ".github/workflows/vcruntime.yml" ]
+  schedule:
+    - cron: "17 5 * * *"   # täglich 05:17 UTC: neues Madeira-Release?
+  workflow_dispatch:
+    inputs:
+      madeira_tag:
+        description: "Madeira-Release-Tag (leer = neuestes)"
+        required: false
+        default: ""
+      force:
+        description: "Neu bauen, auch wenn das Release schon existiert"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Neues Madeira-Release?
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.madeira_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          TAG=$(gh release view $TAG -R willfaust/Madeira --json tagName -q .tagName)
+          echo "Madeira: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          if gh release view "madeira-$TAG-vcruntime" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            echo "Release madeira-$TAG-vcruntime existiert schon — nichts zu tun"
+            echo "build=false" >> $GITHUB_OUTPUT
+          else
+            echo "build=true" >> $GITHUB_OUTPUT
+          fi
+
+  vcruntime:
+    name: VC++ Runtime DLLs holen (Windows)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Aktuelle VC++ 2015-2022 x64 Runtime installieren
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+          $p = Start-Process .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+          # 0 = ok, 1638 = neuere Version schon installiert, 3010 = Neustart nötig
+          if ($p.ExitCode -notin 0,1638,3010) { throw "vc_redist ExitCode $($p.ExitCode)" }
+
+      - name: 12 DLLs unverändert aus System32 kopieren
+        shell: pwsh
+        run: |
+          $dlls = 'concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll',
+                  'msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcamp140.dll',
+                  'vccorlib140.dll','vcomp140.dll','vcruntime140.dll','vcruntime140_1.dll',
+                  'vcruntime140_threads.dll'
+          New-Item -ItemType Directory x86_64-vcruntime | Out-Null
+          foreach ($d in $dlls) {
+            Copy-Item "$env:WINDIR\System32\$d" x86_64-vcruntime\ -ErrorAction Stop
+            $sig = Get-AuthenticodeSignature "x86_64-vcruntime\$d"
+            if ($sig.Status -ne 'Valid') { throw "${d}: Signatur $($sig.Status)" }
+            "{0,-28} {1,-14} {2}" -f $d, (Get-Item "x86_64-vcruntime\$d").VersionInfo.FileVersion, $sig.Status
+          }
+          (Get-Item x86_64-vcruntime\vcruntime140_1.dll).VersionInfo.FileVersion | Out-File -NoNewline x86_64-vcruntime\VERSION.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: x86_64-vcruntime/
+          retention-days: 1
+
+  ipa:
+    name: IPA bauen + Release anlegen
+    needs: [check, vcruntime]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MADEIRA_TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Madeira-Release-IPA herunterladen
+        run: |
+          gh release download "$MADEIRA_TAG" -R willfaust/Madeira --pattern '*.ipa' --dir in
+          ls -la in
+          test "$(ls in/*.ipa | wc -l)" = 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: vcrt
+
+      - name: Authenticode-Signaturen prüfen (Dateien müssen unverändert sein)
+        run: |
+          echo "VCRT_VERSION=$(cat vcrt/VERSION.txt)" >> $GITHUB_ENV
+          rm vcrt/VERSION.txt
+          test "$(ls vcrt/*.dll | wc -l)" = 12
+          python3 - vcrt/*.dll <<'PY'
+          import struct, sys
+          bad = 0
+          for path in sys.argv[1:]:
+              d = open(path, 'rb').read()
+              pe = struct.unpack_from('<I', d, 0x3c)[0]
+              assert struct.unpack_from('<H', d, pe + 4)[0] == 0x8664, path + ' ist nicht x64'
+              off, size = struct.unpack_from('<II', d, pe + 24 + 112 + 4*8)
+              ok = size and off + size <= len(d)
+              bad += not ok
+              print(('signed  ' if ok else 'UNSIGNED'), path)
+          sys.exit(bad)
+          PY
+
+      - name: DLLs in die IPA einfügen
+        run: |
+          IPA=$(ls in/*.ipa)
+          APP=$(unzip -Z1 "$IPA" | grep -m1 -oE '^Payload/[^/]+\.app/')
+          echo "App im IPA: $APP"
+          OUT="Madeira-${MADEIRA_TAG}-vcruntime.ipa"
+          cp "$IPA" "$OUT"
+          # Nur die neuen Dateien anhängen — der Rest des Archivs bleibt bitgleich
+          mkdir -p "stage/$APP/x86_64-vcruntime"
+          cp vcrt/*.dll "stage/$APP/x86_64-vcruntime/"
+          (cd stage && zip -r "../$OUT" Payload)
+          unzip -l "$OUT" | grep x86_64-vcruntime
+          echo "OUT=$OUT" >> $GITHUB_ENV
+
+      - name: Release anlegen
+        run: |
+          REL="madeira-$MADEIRA_TAG-vcruntime"
+          NOTES="Madeira $MADEIRA_TAG (https://github.com/willfaust/Madeira/releases/tag/$MADEIRA_TAG)
+          + Microsoft Visual C++ Runtime x64 $VCRT_VERSION in Madeira.app/x86_64-vcruntime/
+
+          Sonst unverändert (keine Patches). Unsigniert für Sideloading: in Feather oder SideStore importieren und signieren."
+          if gh release view "$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$REL" "$OUT" --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$REL" --notes "$NOTES" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$REL" "$OUT" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Madeira $MADEIRA_TAG + VC++ Runtime" --notes "$NOTES"
+          fi
+          gh release view "$REL" -R "$GITHUB_REPOSITORY" --json url,assets -q '.url, (.assets[] | "  " + .name)'

@@ -280,7 +280,13 @@ fex-pe)
 vcruntime)
     log "VC++ Runtime, i386-windows, aarch64-Dienste aus ${BASE_IPA_REPO:?} ${BASE_IPA_TAG:-(neuestes)}"
     rm -rf /tmp/pf && mkdir -p /tmp/pf
-    gh release download ${BASE_IPA_TAG:+"$BASE_IPA_TAG"} -R "$BASE_IPA_REPO" --pattern '*.ipa' --dir /tmp/pf
+    if [ -z "${BASE_IPA_TAG:-}" ]; then
+        # neuestes Release mit IPA, Vorabversionen eingeschlossen, ohne die App-Test-Builds selbst
+        BASE_IPA_TAG=$(gh api "repos/$BASE_IPA_REPO/releases?per_page=30" \
+            -q '[.[] | select((.tag_name | test("app")) | not) | select(any(.assets[]; .name | endswith(".ipa")))][0].tag_name')
+        echo "Basis-Release: $BASE_IPA_TAG"
+    fi
+    gh release download "${BASE_IPA_TAG:?kein Basis-Release gefunden}" -R "$BASE_IPA_REPO" --pattern '*.ipa' --dir /tmp/pf
     IPA="$(ls /tmp/pf/*.ipa | head -1)"
     mkdir -p app/Madeira/x86_64-vcruntime
     unzip -q -o -j "$IPA" 'Payload/*.app/x86_64-vcruntime/*' -d app/Madeira/x86_64-vcruntime

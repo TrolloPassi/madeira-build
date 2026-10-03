@@ -263,6 +263,8 @@ dock)
 fex-pe)
     log "FEX ARM64EC (xtajit64.dll) mit Patches, Optionen wie build/fex-arm64ec/build.sh"
     if git -C FEX diff --quiet; then apply_patches fex FEX; else echo "FEX bereits gepatcht"; fi
+    python3 -c 'import packaging' 2>/dev/null || python3 -m pip install -q --break-system-packages packaging || python3 -m pip install -q --user packaging
+    command -v ninja >/dev/null || brew install -q ninja
     cmake -S FEX -B FEX/build-arm64ec -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$M/FEX/Data/CMake/toolchain_mingw.cmake" -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
         -DFEX_IOS_HOST_BUILD=ON -DCMAKE_C_FLAGS=-DFEX_IOS_HOST -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST \

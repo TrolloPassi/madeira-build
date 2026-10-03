@@ -1,0 +1,23 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index ad2998e..9cbb268 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -3533,6 +3533,18 @@ __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
+                    "brk #1" )
+ 
+ 
++/* iOS-Madeira: room for x64 hook trampolines above ntdll's code.
++ *
++ * Hook libraries patch ntdll's x64 syscall stubs and need an executable page
++ * within rel32 reach ABOVE them; Minecraft Dungeons' winmm.dll scans upward
++ * only and rejects anything below the stub.  On iOS everything above ntdll is
++ * the [cage] holdback, so no allocation there can succeed.  kernelbase's
++ * VirtualAlloc hands out the 64 KB slots of this section instead (slot 0 holds
++ * the allocation counter).  The build marks the section executable. */
++__attribute__((section(".mhook"), aligned(0x1000), used))   /* the section itself starts 64 KB-aligned */
++char madeira_hook_arena[5 * 0x10000] = { 'M', 'H', 'K', '0' };
++
++
+ /*******************************************************************
+  *		dispatch_syscall
+  */

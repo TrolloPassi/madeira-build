@@ -1,0 +1,20 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 39425a5..ad2998e 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -3542,7 +3542,14 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
+     {
+         context->X0 = context->X4;  /* get first param from r10 */
+         context->X4 = context->Pc;  /* and save return address to syscall thunk */
+-        context->Pc = (ULONG_PTR)invoke_arm64ec_syscall;
++        /* iOS-Madeira: invoke_arm64ec_syscall is x64 code. Taken PC-relatively from
++         * the JIT-pool copy this function runs in, its address is a POOL VA; FEX
++         * must be handed the guest PE VA instead. A child process's ntdll copy is
++         * not in FEX's alias table at all, so the pool VA was a NoExec block and
++         * every direct x64 `syscall` there died (Minecraft Dungeons'
++         * Dungeons-Win64-Shipping.exe: rip = child-ntdll pool + 0x87050). The
++         * reverse hook returns its input when unset or not a pool address. */
++        context->Pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)invoke_arm64ec_syscall );
+     }
+     else context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
+ 

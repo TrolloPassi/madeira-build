@@ -1,0 +1,67 @@
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -3453,6 +3453,13 @@
+ 
+                 res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
+                                         &dispatch, handler );
++                if (!is_ec)
++                {
++                    if (rec->ExceptionCode != 0xe06d7363)
++                        ERR( "[seh-ret] guest handler %p returned %#lx for code=%lx addr=%p flags=%lx frame=%I64x Rip=%p\n",
++                             handler, res, rec->ExceptionCode, rec->ExceptionAddress, rec->ExceptionFlags,
++                             dispatch.EstablisherFrame, (void *)(ULONG_PTR)orig_context->Rip );
++                }
+             }
+             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
+             TRACE( "handler at %p returned %lu\n", dispatch.LanguageHandler, res );
+@@ -4636,6 +4643,13 @@
+                    dispatch.ContextRecord, &dispatch );
+             res = call_unwind_handler( rec, dispatch.EstablisherFrame, dispatch.ContextRecord,
+                                        &dispatch, dispatch.LanguageHandler );
++            if (!RtlIsEcCode( (ULONG_PTR)dispatch.LanguageHandler ))
++            {
++                if (rec->ExceptionCode != 0xe06d7363 && rec->ExceptionCode != STATUS_UNWIND)
++                    ERR( "[unwind-ret] guest handler %p returned %#lx for code=%lx flags=%lx frame=%I64x end=%p\n",
++                         dispatch.LanguageHandler, res, rec->ExceptionCode, rec->ExceptionFlags,
++                         dispatch.EstablisherFrame, end_frame );
++            }
+             TRACE( "handler %p returned %lx\n", dispatch.LanguageHandler, res );
+ 
+             switch (res)
+@@ -5034,6 +5048,27 @@
+ 
+ 
+ /***********************************************************************
++ *		madeira_raise_dispatch
++ *
++ * SRTRelay: RtlCaptureContext runs in the JIT-pool copy, so ExceptionAddress was a pool
++ * address outside every module (Dungeons: 0x150d0c110 instead of kernelbase+0x18110).
++ * Handlers that check where an exception came from see the PE address again.
++ */
++NTSTATUS WINAPI madeira_raise_dispatch( EXCEPTION_RECORD *rec, CONTEXT *context )
++{
++    void *addr = xlate_ios_jit_rev( rec->ExceptionAddress );
++
++    /* no static counter: ntdll's .data layout (exported ios_xp_nt) must not move */
++    if (addr != rec->ExceptionAddress && rec->ExceptionCode != 0xe06d7363 /* C++ */ &&
++        rec->ExceptionCode != 0x406d1388 /* thread name */ && rec->ExceptionCode != DBG_PRINTEXCEPTION_C &&
++        rec->ExceptionCode != DBG_PRINTEXCEPTION_WIDE_C)
++        ERR( "[raise-addr] code=%lx ExceptionAddress %p -> %p\n", rec->ExceptionCode, rec->ExceptionAddress, addr );
++    rec->ExceptionAddress = addr;
++    return dispatch_exception( rec, context );
++}
++
++
++/***********************************************************************
+  *		RtlRaiseException (NTDLL.@)
+  */
+ void __attribute((naked)) RtlRaiseException( EXCEPTION_RECORD *rec )
+@@ -5058,7 +5093,7 @@
+          "ldr x3, [x18, #0x60]\n\t"    /* peb */
+          "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
+          "cbnz w2, 1f\n\t"
+-         "bl \"#dispatch_exception\"\n"
++         "bl \"#madeira_raise_dispatch\"\n"
+          "1:\tmov w2, #1\n\t"
+          "bl \"#NtRaiseException\"\n\t"
+          "b \"#RtlRaiseStatus\"\n\t" /* does not return */

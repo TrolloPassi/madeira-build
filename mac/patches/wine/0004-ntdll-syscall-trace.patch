@@ -1,0 +1,45 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 9cbb268..9749b9c 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -3544,12 +3544,40 @@ __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
+ __attribute__((section(".mhook"), aligned(0x1000), used))   /* the section itself starts 64 KB-aligned */
+ char madeira_hook_arena[5 * 0x10000] = { 'M', 'H', 'K', '0' };
+ 
++/* Slot 0 layout, shared with kernelbase (struct hook_arena_hdr there). */
++struct madeira_hook_arena_hdr { char magic[4]; LONG next_slot; LONG trace_tid; LONG trace_left; };
++
++static const char *const madeira_syscall_names[] =
++{
++#define SYSCALL_ENTRY(id,name,args) [id] = #name,
++ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++};
++
++/* Diagnostics: kernelbase arms trace_tid after a near-hint grant; log that
++ * thread's direct x64 syscalls (the ones that bypass kernelbase). */
++static void madeira_trace_syscall( const ARM64_NT_CONTEXT *context )
++{
++    struct madeira_hook_arena_hdr *hdr = (struct madeira_hook_arena_hdr *)madeira_hook_arena;
++    const char *name;
++
++    if (!hdr->trace_tid || hdr->trace_tid != (LONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread) return;
++    if (InterlockedDecrement( &hdr->trace_left ) < 0) return;
++    name = context->X8 < ARRAY_SIZE(madeira_syscall_names) ? madeira_syscall_names[context->X8] : NULL;
++    ERR( "[trace] syscall %#llx %s(%#llx, %#llx, %#llx, %#llx) from rip %#llx\n",
++         (unsigned long long)context->X8, name ? name : "?",
++         (unsigned long long)context->X4, (unsigned long long)context->X1,
++         (unsigned long long)context->X2, (unsigned long long)context->X3,
++         (unsigned long long)context->Pc );
++}
++
+ 
+ /*******************************************************************
+  *		dispatch_syscall
+  */
+ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
+ {
++    madeira_trace_syscall( context );
+     if (context->X8 < __nb_syscalls)  /* syscall number in rax */
+     {
+         context->X0 = context->X4;  /* get first param from r10 */

@@ -1,0 +1,219 @@
+name: Madeira App (macOS, komplett gebaut)
+
+# Baut die Madeira-App aus dem Quellcode des Releases (github.com/willfaust/Madeira)
+# auf macOS-Runnern, mit allen Patches aus mac/patches/ (fex, wine, madeira,
+# madeira-dock). Damit lassen sich auch die Teile ändern, die fest in die
+# App-Binary gelinkt sind (z.B. build/ntdll-unix/virtual_ios.c).
+# Ergebnis: unsignierte IPA als Vorab-Release "madeira-<tag>-app-test".
+#
+# LLVM für iOS (Stunden) wird einmal gebaut und im Actions-Cache abgelegt;
+# FEX, die Abhängigkeiten (GnuTLS, FFmpeg, FreeType) und LLVM laufen parallel.
+# Stufen: mac/madeira-mac.sh
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ ".github/workflows/madeira-app.yml", "mac/**" ]
+  workflow_dispatch:
+    inputs:
+      madeira_tag:
+        description: "Madeira-Release-Tag (leer = neuestes)"
+        default: ""
+      only_unix:
+        description: "Nur Wine (Host/PE) + Unix-Bibliotheken bauen (schneller Test für virtual_ios.c)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  LLVM_SHORT: 8dfdcc7b7
+  SRT: ${{ github.workspace }}
+  PATCH_DIR: ${{ github.workspace }}/mac/patches
+  TOOL_DIR: ${{ github.workspace }}/mac   # docs/BUILDING.md: LLVM-Commit der iOS-Toolchain
+
+jobs:
+  resolve:
+    name: Versionen bestimmen
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      fex: ${{ steps.v.outputs.fex }}
+      llvm: ${{ steps.v.outputs.llvm }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.madeira_tag }}"
+          TAG=$(gh release view $TAG -R willfaust/Madeira --json tagName -q .tagName)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "fex=$(gh api "repos/willfaust/Madeira/contents/FEX?ref=$TAG" -q .sha)" >> $GITHUB_OUTPUT
+          echo "llvm=$(gh api "repos/llvm/llvm-project/commits/$LLVM_SHORT" -q .sha)" >> $GITHUB_OUTPUT
+          cat $GITHUB_OUTPUT
+
+  llvm:
+    name: LLVM für iOS
+    needs: resolve
+    if: ${{ !inputs.only_unix }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Madeira holen (nur das Repo, für die Pfade)
+        run: git clone -q --depth 1 --branch "${{ needs.resolve.outputs.tag }}" https://github.com/willfaust/Madeira m
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: m/llvm-ios.tar
+          key: llvm-ios-${{ needs.resolve.outputs.llvm }}-v1
+      - if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          LLVM_SHA: ${{ needs.resolve.outputs.llvm }}
+        run: bash mac/madeira-mac.sh llvm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llvm-ios
+          path: m/llvm-ios.tar
+          retention-days: 3
+          compression-level: 1
+
+  fex:
+    name: FEXCore für iOS
+    needs: resolve
+    if: ${{ !inputs.only_unix }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: m/fex-ios.tar
+          key: fex-ios-${{ needs.resolve.outputs.fex }}-${{ hashFiles('mac/patches/fex/**', 'mac/madeira-mac.sh') }}
+      - name: Madeira + FEX holen
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 --branch "${{ needs.resolve.outputs.tag }}" https://github.com/willfaust/Madeira m
+          git -C m/FEX init -q
+          git -C m/FEX remote add origin https://github.com/willfaust/FEX.git
+          git -C m/FEX fetch -q --depth 1 origin "${{ needs.resolve.outputs.fex }}"
+          git -C m/FEX checkout -q FETCH_HEAD
+          for p in External/fex-posixtest-bins External/fex-gvisor-tests-bins External/fex-gcc-target-tests-bins External/Catch2; do
+            git -C m/FEX config "submodule.$p.update" none
+          done
+          git -C m/FEX submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: bash mac/madeira-mac.sh fex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex-ios
+          path: m/fex-ios.tar
+          retention-days: 3
+          compression-level: 1
+
+  deps:
+    name: GnuTLS, FFmpeg, FreeType für iOS
+    needs: resolve
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: m/deps.tar
+          key: deps-ios-${{ needs.resolve.outputs.tag }}-v1
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 --branch "${{ needs.resolve.outputs.tag }}" https://github.com/willfaust/Madeira m
+          bash mac/madeira-mac.sh deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deps-ios
+          path: m/deps.tar
+          retention-days: 3
+          compression-level: 1
+
+  app:
+    name: Wine, DXMT, App
+    needs: [resolve, llvm, fex, deps]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.deps.result == 'success' && (inputs.only_unix || (needs.llvm.result == 'success' && needs.fex.result == 'success')) }}
+    # macOS 26 / Xcode 26: Madeiras Unix-Quellen brauchen das iOS-26-SDK (rusage_info_v6)
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MADEIRA_TAG: ${{ needs.resolve.outputs.tag }}
+      # neuestes (Nicht-Vorab-)Release dieses Repos: build.yml legt dort die VC++ Runtime ab
+      BASE_IPA_REPO: ${{ github.repository }}
+      BASE_IPA_TAG: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Madeira mit Submodulen holen
+        run: |
+          git clone -q --depth 1 --branch "$MADEIRA_TAG" https://github.com/willfaust/Madeira m
+          git -C m submodule update --init --depth 1 wine dxmt madeira-dock
+          # DXMTs eigene Submodule: mingw-directx-headers (d3d9.h, d3d11.h …) und nvapi
+          git -C m/dxmt submodule update --init --depth 1 include/native/directx external/nvapi
+          git -C m/FEX init -q
+          git -C m/FEX remote add origin https://github.com/willfaust/FEX.git
+          git -C m/FEX fetch -q --depth 1 origin "${{ needs.resolve.outputs.fex }}"
+          git -C m/FEX checkout -q FETCH_HEAD
+          for p in External/fex-posixtest-bins External/fex-gvisor-tests-bins External/fex-gcc-target-tests-bins External/Catch2; do
+            git -C m/FEX config "submodule.$p.update" none
+          done
+          git -C m/FEX submodule update --init --recursive --depth 1 --jobs 8
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: Artefakte auspacken
+        run: |
+          for t in art/llvm-ios/llvm-ios.tar art/fex-ios/fex-ios.tar art/deps-ios/deps.tar; do
+            [ -f "$t" ] && tar -C m -xf "$t" || echo "ohne $t"
+          done
+          ls m/toolchains
+      - run: bash mac/madeira-mac.sh tools
+      - run: bash mac/madeira-mac.sh wine-host
+      - run: bash mac/madeira-mac.sh wine-pe
+      - run: bash mac/madeira-mac.sh unix
+      - if: ${{ !inputs.only_unix }}
+        run: bash mac/madeira-mac.sh dxmt
+      - if: ${{ !inputs.only_unix }}
+        run: bash mac/madeira-mac.sh dock
+      - if: ${{ !inputs.only_unix }}
+        run: bash mac/madeira-mac.sh fex-pe
+      - if: ${{ !inputs.only_unix }}
+        run: bash mac/madeira-mac.sh vcruntime
+      - if: ${{ !inputs.only_unix }}
+        run: bash mac/madeira-mac.sh app
+      - name: Logs sichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            m/xcodebuild.log
+            m/wine/build-macos/configure.log
+            m/wine/build-arm64ec/configure.log
+            m/wine/build-arm64ec/make.log
+            m/build/*/obj/*.err
+          if-no-files-found: ignore
+      - name: Vorab-Release anlegen
+        if: ${{ !inputs.only_unix }}
+        run: |
+          OUT=$(ls m/*.ipa)
+          REL="madeira-$MADEIRA_TAG-app-test"
+          {
+            echo "Madeira $MADEIRA_TAG, komplett aus dem Quellcode gebaut (Debug, unsigniert) · Build $GITHUB_SHA"
+            echo
+            echo "## App-Test (experimentell)"
+            echo
+            echo "Enthält alle Patches aus \`mac/patches/\` (FEX, Wine, Madeira, Madeira Dock) sowie die VC++ Runtime."
+            echo "Signieren mit Feather oder SideStore."
+          } > notes.md
+          if gh release view "$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$REL" "$OUT" --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$REL" --notes-file notes.md -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$REL" "$OUT" -R "$GITHUB_REPOSITORY" --prerelease \
+              --target "$GITHUB_SHA" --title "Madeira $MADEIRA_TAG – App-Test" --notes-file notes.md
+          fi
+          gh release view "$REL" -R "$GITHUB_REPOSITORY" --json url -q .url

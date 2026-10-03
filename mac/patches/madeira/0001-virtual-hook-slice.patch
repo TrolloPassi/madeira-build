@@ -1,0 +1,72 @@
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+index 5e2a292..c44056b 100644
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -16974,6 +16974,11 @@ void virtual_init(void)
+         ios_cage_holdback_live = 1;
+         dprintf( 2, "[cage] holdback reserved 0x%llx+0x%llx rev=ml433\n",
+                  (unsigned long long)IOS_CAGE_BASE, (unsigned long long)IOS_CAGE_REAL_SIZE );
++        /* madeira-srt hook-slice (see NtAllocateVirtualMemory): tell kernelbase's
++         * near-hint fallback that hinted requests into the holdback can succeed,
++         * so it leaves the hook library's own scan alone. The environment block
++         * of the first process is built from environ after this. */
++        setenv( "MADEIRA_HOOK_SLICE", "1", 0 );
+     }
+     else dprintf( 2, "[cage] holdback reserve FAILED (errno %d) rev=ml433\n", errno );
+ 
+@@ -20721,6 +20726,55 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
+             if (!ios_steered)
+                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+ 
++            /* madeira-srt hook-slice: let a hook library's trampoline land in the
++             * cage holdback, where Windows would have put it.
++             *
++             * x64 hook libraries patch ntdll's syscall stubs with a jmp rel32 and
++             * need an executable page within 2 GB ABOVE the stub. They find it by
++             * asking for one page at the stub's address and then at every page
++             * above it; on Windows the first free 64 KB after ntdll answers. Here
++             * everything above ntdll is the [cage] holdback (ml433), a PROT_NONE
++             * reservation for an 8 GB V8 cage that a game process never asks for,
++             * so Minecraft Dungeons' winmm.dll made 458,752 failing requests up to
++             * ntdll + 1.75 GB, showed "Error at hooking" and exited (0xdeadc0de).
++             * A page handed out elsewhere (below ntdll, or inside ntdll's image)
++             * was rejected by the library as well.
++             *
++             * So a SMALL hinted executable reservation that fails only because its
++             * hint lies in the bottom 2 GB of the holdback gets exactly that VA:
++             * the slice is released from the PROT_NONE reservation and the request
++             * is placed again at its hint, as on Windows (64 KB granularity,
++             * MEM_PRIVATE). The holdback is then no longer whole, so the paths that
++             * munmap or re-map the entire range (the 8 GB cage grant, the WoW slot
++             * carve) are told so via ios_cage_holdback_live, like the WoW carve
++             * does. At most 16 slices; everything else is unchanged. */
++            if (st == STATUS_CONFLICTING_ADDRESSES && ios_cage_holdback_live && jumbo_hint && jumbo_size &&
++                jumbo_size <= 0x100000 && (type & MEM_RESERVE) &&
++                (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++            {
++                static unsigned slices;
++                uintptr_t lo = (uintptr_t)jumbo_hint & ~(uintptr_t)granularity_mask;
++                uintptr_t hi = ((uintptr_t)jumbo_hint + jumbo_size + granularity_mask) & ~(uintptr_t)granularity_mask;
++
++                if (lo >= IOS_CAGE_BASE && hi <= IOS_CAGE_BASE + 0x80000000ULL && slices < 16)
++                {
++                    if (munmap( (void *)lo, hi - lo ) == 0)
++                    {
++                        slices++;
++                        ios_cage_holdback_live = 0;
++                        *ret = jumbo_hint;
++                        *size_ptr = jumbo_size;
++                        st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
++                        dprintf( 2, "[hook-slice] #%u released 0x%llx+0x%llx of the cage holdback for a hinted "
++                                    "exec request %p+0x%llx -> %p status=%#x (holdback no longer whole)\n",
++                                 slices, (unsigned long long)lo, (unsigned long long)(hi - lo), jumbo_hint,
++                                 (unsigned long long)jumbo_size, st ? NULL : *ret, (unsigned)st );
++                    }
++                    else dprintf( 2, "[hook-slice] munmap(0x%llx+0x%llx) FAILED errno=%d\n",
++                                  (unsigned long long)lo, (unsigned long long)(hi - lo), errno );
++                }
++            }
++
+             /* ml373 census: name what still lands in the guest band once the
+              * valve has had its say. The [window] histogram gives sizes but no
+              * owner, so a single wrong guess about WHO reserves the 8.4GB costs a

@@ -26,6 +26,16 @@ der Build ab.
 
 Was sich geändert hat: [`CHANGELOG.md`](CHANGELOG.md).
 
+## Komplettbuild auf macOS (`mac/`)
+
+Der Workflow [`madeira-app.yml`](.github/workflows/madeira-app.yml) baut die ganze App aus
+Madeiras Quellcode auf macOS-Runnern (in öffentlichen Repos kostenlos), inklusive der Teile,
+die fest in die App-Binary gelinkt sind (Unix-Seite von Wine, wineserver, DXMT, FEXCore).
+Stufen: [`mac/madeira-mac.sh`](mac/madeira-mac.sh), Patches: [`mac/patches/`](mac/patches)
+(fex, wine, madeira, madeira-dock). VC++ Runtime, `i386-windows` und die aarch64-Dienste
+kommen unverändert aus dem neuesten Release dieses Repos. Ergebnis: Vorab-Release
+`madeira-<tag>-app-test`.
+
 ## Installieren
 
 IPA aus den [Releases](../../releases) laden, in Feather oder SideStore

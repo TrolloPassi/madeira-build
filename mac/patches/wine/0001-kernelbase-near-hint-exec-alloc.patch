@@ -1,0 +1,492 @@
+diff --git a/dlls/kernelbase/kernelbase.h b/dlls/kernelbase/kernelbase.h
+index e46ca0f..52e86cd 100644
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -45,6 +45,11 @@ extern const WCHAR system_dir[];
+ static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
+ extern BOOL is_wow64;
+ 
++/* iOS-Madeira near-hint diagnostics (memory.c) */
++extern BOOL near_hint_tracing(void);
++extern void near_hint_dump( const char *why );
++#define NEAR_TRACE(...) do { if (near_hint_tracing()) ERR( "[trace] " __VA_ARGS__ ); } while (0)
++
+ static inline BOOL set_ntstatus( NTSTATUS status )
+ {
+     if (status) SetLastError( RtlNtStatusToDosError( status ));
+diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
+index f4e1ca2..3b4fb6b 100644
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -343,6 +343,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH GetModuleHandleW( LPCWSTR module )
+     HMODULE ret;
+ 
+     GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, module, &ret );
++    NEAR_TRACE( "GetModuleHandleW(%s) -> %p\n", debugstr_w(module), ret );
+     return ret;
+ }
+ 
+@@ -490,7 +491,10 @@ __ASM_GLOBAL_FUNC( GetProcAddress,
+ 
+ FARPROC WINAPI DECLSPEC_HOTPATCH GetProcAddress( HMODULE module, LPCSTR function )
+ {
+-    return get_proc_address( module, function );
++    FARPROC ret = get_proc_address( module, function );
++
++    NEAR_TRACE( "GetProcAddress(%p, %s) -> %p\n", module, debugstr_a(function), ret );
++    return ret;
+ }
+ 
+ #endif /* __x86_64__ */
+diff --git a/dlls/kernelbase/memory.c b/dlls/kernelbase/memory.c
+index 1dd0291..08581f6 100644
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -141,6 +141,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID add
+         send_cross_process_notification( list, CrossProcessFlushCache, addr, size, 0 );
+         close_cross_process_connection( list );
+     }
++    NEAR_TRACE( "FlushInstructionCache(%p, %p, %#Ix)\n", process, addr, size );
+     return set_ntstatus( NtFlushInstructionCache( process, addr, size ));
+ }
+ 
+@@ -352,7 +353,10 @@ LPVOID WINAPI DECLSPEC_HOTPATCH MapViewOfFile3( HANDLE handle, HANDLE process, P
+ BOOL WINAPI DECLSPEC_HOTPATCH ReadProcessMemory( HANDLE process, const void *addr, void *buffer,
+                                                  SIZE_T size, SIZE_T *bytes_read )
+ {
+-    return set_ntstatus( NtReadVirtualMemory( process, addr, buffer, size, bytes_read ));
++    NTSTATUS status = NtReadVirtualMemory( process, addr, buffer, size, bytes_read );
++
++    NEAR_TRACE( "ReadProcessMemory(%p, %p, %#Ix) status %#lx\n", process, addr, size, status );
++    return set_ntstatus( status );
+ }
+ 
+ 
+@@ -423,6 +427,273 @@ LPVOID WINAPI DECLSPEC_HOTPATCH VirtualAlloc( void *addr, SIZE_T size, DWORD typ
+ }
+ 
+ 
++/* iOS-Madeira: hook trampolines near a busy address.
++ *
++ * x64 hook libraries put a trampoline within rel32 reach (+-2 GB) of the
++ * function they patch and find room by asking VirtualAlloc for one executable
++ * page at the function's address, then at successive addresses above it.  On
++ * Windows the first free page after the module answers.  On iOS the guest band
++ * above ntdll is the [cage] holdback [0x7200000000, 0x73ffff0000), which is
++ * mapped natively and refuses every fixed request: Minecraft Dungeons' winmm.dll
++ * made 458,752 attempts from ntdll's NtProtectVirtualMemory stub up to +1.75 GB,
++ * showed "Error at hooking" and exited with 0xdeadc0de, while gigabytes below
++ * ntdll were free.
++ *
++ * So when such a request fails with STATUS_CONFLICTING_ADDRESSES, hand out a
++ * slot of ntdll's .mhook section, which lies above the hooked stubs: winmm.dll
++ * rejected a page 140 MB below ntdll without even trying to patch.  When no
++ * slot is left or in reach, place the request in the nearest free region within
++ * reach of the hint: below it first, then above.  Callers take the address
++ * VirtualAlloc returns; it is rounded down to 64 KB even on Windows.  Only
++ * small executable reservations in the current process qualify; everything
++ * else keeps the exact Windows behaviour. */
++#define NEAR_HINT_REACH     0x7ff00000   /* rel32 reach, less 1 MB of slack */
++#define NEAR_HINT_MAX_SIZE  0x100000
++#define NEAR_HINT_STEP      0x100000     /* retry stride inside a region that only looks free */
++#define NEAR_HINT_MAX_TRIES 4096
++#define NEAR_HINT_REGIONS   256          /* free regions below the hint kept as candidates */
++#define NEAR_HINT_SKIP      0x10000000   /* after a failed search, hints this close above it fail fast */
++
++static BOOL near_hint_try( ULONG_PTR cand, SIZE_T size, DWORD type, DWORD protect, void **ret )
++{
++    void *base = (void *)cand;
++    SIZE_T sz = size;
++
++    if (NtAllocateVirtualMemory( GetCurrentProcess(), &base, 0, &sz, type, protect )) return FALSE;
++    *ret = base;
++    return TRUE;
++}
++
++/* Slot 0 of ntdll's .mhook section (see madeira_hook_arena in ntdll). ntdll
++ * reads trace_tid/trace_left too, in its syscall dispatcher. */
++struct hook_arena_hdr
++{
++    char magic[4];      /* "MHK0" */
++    LONG next_slot;     /* last slot handed out; slot 0 is this header */
++    LONG trace_tid;     /* thread whose calls are traced after a near-hint grant */
++    LONG trace_left;    /* trace lines left, shared with ntdll */
++};
++#define HOOK_SLOT_SIZE 0x10000
++
++static struct hook_arena_hdr *hook_arena( SIZE_T *size )
++{
++    static struct hook_arena_hdr *hdr;
++    static SIZE_T hdr_size;
++    static int searched;
++
++    /* Looked up through ntdll directly: GetModuleHandleW is traced below and
++     * would recurse into this function (ml-srt: that recursion overflowed the
++     * stack at process start). */
++    if (!searched)
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING( L"ntdll.dll" );
++        HMODULE ntdll = NULL;
++        IMAGE_NT_HEADERS *nt;
++        IMAGE_SECTION_HEADER *sec;
++        WORD i;
++
++        searched = 1;
++        if (LdrGetDllHandle( NULL, 0, &name, &ntdll ) || !(nt = RtlImageNtHeader( ntdll ))) return NULL;
++        sec = IMAGE_FIRST_SECTION( nt );
++        for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
++        {
++            if (memcmp( sec->Name, ".mhook", 7 )) continue;
++            if (sec->Misc.VirtualSize < 2 * HOOK_SLOT_SIZE) break;
++            if (memcmp( (char *)ntdll + sec->VirtualAddress, "MHK0", 4 )) break;
++            hdr_size = sec->Misc.VirtualSize;
++            hdr = (struct hook_arena_hdr *)((char *)ntdll + sec->VirtualAddress);
++            break;
++        }
++    }
++    if (size) *size = hdr_size;
++    return hdr;
++}
++
++/* Diagnostics: after the first near-hint grant, the calling thread's next
++ * memory/loader calls and direct syscalls are logged (ERR, so they show in
++ * Madeira's log) and TerminateProcess dumps the handed-out pages. */
++static ULONG_PTR near_hint_first_target, near_hint_last_grant;
++
++BOOL near_hint_tracing(void)
++{
++    struct hook_arena_hdr *hdr = hook_arena( NULL );
++
++    return hdr && hdr->trace_tid &&
++           hdr->trace_tid == (LONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread &&
++           InterlockedDecrement( &hdr->trace_left ) >= 0;
++}
++
++static void near_hint_trace_arm( ULONG_PTR target, ULONG_PTR grant )
++{
++    struct hook_arena_hdr *hdr = hook_arena( NULL );
++
++    if (!near_hint_first_target) near_hint_first_target = target;
++    near_hint_last_grant = grant;
++    if (!hdr || hdr->trace_tid) return;
++    hdr->trace_left = 400;
++    hdr->trace_tid = (LONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
++    ERR( "[trace] armed for tid %04lx after grant %#Ix for target %#Ix\n", (DWORD)hdr->trace_tid, grant, target );
++}
++
++static void dump_bytes( const char *what, ULONG_PTR addr, SIZE_T len )
++{
++    char line[3 * 48 + 1];
++    BYTE buf[48];
++    SIZE_T i;
++
++    if (!addr) return;
++    if (len > sizeof(buf)) len = sizeof(buf);
++    if (NtReadVirtualMemory( GetCurrentProcess(), (void *)addr, buf, len, NULL ))
++    {
++        ERR( "[dump] %s %#Ix: unreadable\n", what, addr );
++        return;
++    }
++    for (i = 0; i < len; i++) sprintf( line + 3 * i, "%02x ", buf[i] );
++    ERR( "[dump] %s %#Ix: %s\n", what, addr, line );
++}
++
++void near_hint_dump( const char *why )
++{
++    SIZE_T arena_size;
++    struct hook_arena_hdr *hdr = hook_arena( &arena_size );
++    MEMORY_BASIC_INFORMATION info;
++    LONG i;
++
++    if (!near_hint_first_target) return;
++    ERR( "[dump] at %s: last error %lu\n", why, GetLastError() );
++    dump_bytes( "hook target", near_hint_first_target, 32 );
++    if (near_hint_last_grant)
++    {
++        dump_bytes( "last grant", near_hint_last_grant, 32 );
++        if (VirtualQuery( (void *)near_hint_last_grant, &info, sizeof(info) ))
++            ERR( "[dump] last grant query: base %p alloc %p size %#Ix state %#lx protect %#lx type %#lx\n",
++                 info.BaseAddress, info.AllocationBase, info.RegionSize, info.State, info.Protect, info.Type );
++    }
++    if (hdr) for (i = 1; i <= hdr->next_slot && i < (LONG)(arena_size / HOOK_SLOT_SIZE); i++)
++        dump_bytes( "arena slot", (ULONG_PTR)hdr + i * HOOK_SLOT_SIZE, 32 );
++}
++
++/* A slot of ntdll's .mhook section, if one lies above the hint within reach. */
++static void *alloc_hook_arena( ULONG_PTR hint, SIZE_T size )
++{
++    SIZE_T arena_size;
++    struct hook_arena_hdr *hdr = hook_arena( &arena_size );
++    ULONG_PTR arena = (ULONG_PTR)hdr, slot;
++    LONG idx;
++
++    if (!hdr || size > HOOK_SLOT_SIZE) return NULL;
++    if (arena + HOOK_SLOT_SIZE <= hint || arena + arena_size - hint > NEAR_HINT_REACH) return NULL;
++
++    idx = InterlockedIncrement( &hdr->next_slot );
++    if (idx >= arena_size / HOOK_SLOT_SIZE) return NULL;
++    slot = arena + idx * HOOK_SLOT_SIZE;
++    return slot > hint ? (void *)slot : NULL;
++}
++
++static void *alloc_near_hint( void *addr, SIZE_T size, DWORD type, DWORD protect )
++{
++    static ULONG_PTR failed_hint;   /* a search from here found nothing; callers retry hint + 4 KB */
++    static LONG logged;
++    const ULONG_PTR gran = 0x10000;
++    ULONG_PTR hint = (ULONG_PTR)addr & ~(gran - 1);
++    ULONG_PTR lo = hint > NEAR_HINT_REACH + gran ? hint - NEAR_HINT_REACH : gran;
++    ULONG_PTR hi = hint + NEAR_HINT_REACH;
++    SIZE_T span = (size + gran - 1) & ~(gran - 1);   /* what a placement occupies */
++    ULONG_PTR free_lo[NEAR_HINT_REGIONS], free_hi[NEAR_HINT_REGIONS];
++    ULONG_PTR cursor, cand, rbase, rend;
++    MEMORY_BASIC_INFORMATION info;
++    unsigned int i, count, tries = 0;
++    void *ret;
++
++    if ((ret = alloc_hook_arena( (ULONG_PTR)addr, size )))
++    {
++        if (InterlockedIncrement( &logged ) <= 16)
++            ERR( "near-hint: %p is taken, placed %#Ix bytes at %p in ntdll's .mhook instead\n", addr, size, ret );
++        near_hint_trace_arm( (ULONG_PTR)addr, (ULONG_PTR)ret );
++        return ret;
++    }
++    if (failed_hint && hint - failed_hint < NEAR_HINT_SKIP) return NULL;
++
++    /* below the hint, highest address first.  NtQueryVirtualMemory reports a
++     * region from the queried page up to its end, so walk upward from the
++     * bottom of the reach, remember the free regions nearest the hint, and
++     * try those from the top down. */
++    count = 0;
++    for (cursor = lo; cursor < hint; cursor = rend)
++    {
++        if (NtQueryVirtualMemory( GetCurrentProcess(), (void *)cursor, MemoryBasicInformation,
++                                  &info, sizeof(info), NULL )) break;
++        rbase = (ULONG_PTR)info.BaseAddress;
++        rend = rbase + info.RegionSize;
++        if (rend <= cursor) break;
++        if (info.State != MEM_FREE) continue;
++        free_lo[count % NEAR_HINT_REGIONS] = rbase;
++        free_hi[count % NEAR_HINT_REGIONS] = min( rend, hint );
++        count++;
++    }
++    for (i = count; i > 0 && i + NEAR_HINT_REGIONS > count && tries < NEAR_HINT_MAX_TRIES; i--)
++    {
++        rbase = free_lo[(i - 1) % NEAR_HINT_REGIONS];
++        rend = free_hi[(i - 1) % NEAR_HINT_REGIONS];
++        if (rend - rbase < span) continue;
++        for (cand = (rend - span) & ~(gran - 1); cand >= rbase && tries < NEAR_HINT_MAX_TRIES; cand -= NEAR_HINT_STEP)
++        {
++            tries++;
++            if (near_hint_try( cand, size, type, protect, &ret )) goto done;
++            if (cand < rbase + NEAR_HINT_STEP) break;
++        }
++    }
++
++    /* above the hint, lowest address first */
++    for (cursor = hint + gran; cursor < hi && tries < NEAR_HINT_MAX_TRIES; cursor = rend)
++    {
++        if (NtQueryVirtualMemory( GetCurrentProcess(), (void *)cursor, MemoryBasicInformation,
++                                  &info, sizeof(info), NULL )) break;
++        rbase = max( (ULONG_PTR)info.BaseAddress, cursor );
++        rend = (ULONG_PTR)info.BaseAddress + info.RegionSize;
++        if (rend <= cursor) break;
++        if (info.State != MEM_FREE) continue;
++        for (cand = (rbase + gran - 1) & ~(gran - 1);
++             cand + span <= rend && cand + span <= hi && tries < NEAR_HINT_MAX_TRIES; cand += NEAR_HINT_STEP)
++        {
++            tries++;
++            if (near_hint_try( cand, size, type, protect, &ret )) goto done;
++        }
++    }
++
++    ERR( "near-hint: no room within reach of %p for %#Ix bytes (%u tries); not searching again "
++         "for hints up to %#Ix above it\n", addr, size, tries, (SIZE_T)NEAR_HINT_SKIP );
++    failed_hint = hint;
++    return NULL;
++
++done:
++    if (InterlockedIncrement( &logged ) <= 16)
++        ERR( "near-hint: %p is taken, placed %#Ix bytes at %p instead (%u tries)\n", addr, size, ret, tries );
++    near_hint_trace_arm( (ULONG_PTR)addr, (ULONG_PTR)ret );
++    return ret;
++}
++
++static BOOL near_hint_applies( HANDLE process, void *addr, SIZE_T size, DWORD type, DWORD protect )
++{
++    static int unix_slices = -1;
++    DWORD prot = protect & 0xff;
++
++    /* The unix side can serve hinted requests from the holdback itself (the
++     * hook-slice patch of build/ntdll-unix/virtual_ios.c announces that via
++     * MADEIRA_HOOK_SLICE=1); then the library's own scan reaches a page above
++     * ntdll exactly as on Windows and this fallback must stay out of its way. */
++    if (unix_slices < 0)
++    {
++        WCHAR buf[8];
++        unix_slices = GetEnvironmentVariableW( L"MADEIRA_HOOK_SLICE", buf, ARRAY_SIZE(buf) ) && buf[0] == '1';
++        if (unix_slices) ERR( "near-hint: disabled, the unix side carves hook slices from the holdback\n" );
++    }
++    if (unix_slices) return FALSE;
++    return addr && size && size <= NEAR_HINT_MAX_SIZE && process == GetCurrentProcess() &&
++           (type & MEM_RESERVE) && !(type & ~(MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN)) &&
++           (prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE);
++}
++
+ /***********************************************************************
+  *             VirtualAllocEx   (kernelbase.@)
+  */
+@@ -430,8 +701,14 @@ LPVOID WINAPI DECLSPEC_HOTPATCH VirtualAllocEx( HANDLE process, void *addr, SIZE
+                                                 DWORD type, DWORD protect )
+ {
+     LPVOID ret = addr;
++    NTSTATUS status = NtAllocateVirtualMemory( process, &ret, 0, &size, type, protect );
+ 
+-    if (!set_ntstatus( NtAllocateVirtualMemory( process, &ret, 0, &size, type, protect ))) return NULL;
++    NEAR_TRACE( "VirtualAllocEx(%p, %p, %#Ix, %#lx, %#lx) -> %p status %#lx\n",
++                process, addr, size, type, protect, status ? NULL : ret, status );
++    if (status == STATUS_CONFLICTING_ADDRESSES && near_hint_applies( process, addr, size, type, protect )
++        && (ret = alloc_near_hint( addr, size, type, protect )))
++        return ret;
++    if (!set_ntstatus( status )) return NULL;
+     return ret;
+ }
+ 
+@@ -447,7 +724,11 @@ LPVOID WINAPI DECLSPEC_HOTPATCH VirtualAlloc2( HANDLE process, void *addr, SIZE_
+ 
+     if (!process) process = GetCurrentProcess();
+     if (!set_ntstatus( NtAllocateVirtualMemoryEx( process, &ret, &size, type, protect, parameters, count )))
++    {
++        NEAR_TRACE( "VirtualAlloc2(%p, %p, %#Ix, %#lx, %#lx) failed %lu\n", process, addr, size, type, protect, GetLastError() );
+         return NULL;
++    }
++    NEAR_TRACE( "VirtualAlloc2(%p, %p, %#Ix, %#lx, %#lx) -> %p\n", process, addr, size, type, protect, ret );
+     return ret;
+ }
+ 
+@@ -476,7 +757,11 @@ LPVOID WINAPI DECLSPEC_HOTPATCH VirtualAlloc2FromApp( HANDLE process, void *addr
+ 
+     if (!process) process = GetCurrentProcess();
+     if (!set_ntstatus( NtAllocateVirtualMemoryEx( process, &ret, &size, type, protect, parameters, count )))
++    {
++        NEAR_TRACE( "VirtualAlloc2(%p, %p, %#Ix, %#lx, %#lx) failed %lu\n", process, addr, size, type, protect, GetLastError() );
+         return NULL;
++    }
++    NEAR_TRACE( "VirtualAlloc2(%p, %p, %#Ix, %#lx, %#lx) -> %p\n", process, addr, size, type, protect, ret );
+     return ret;
+ }
+ 
+@@ -534,6 +819,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH VirtualFreeEx( HANDLE process, void *addr, SIZE_T
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
++    NEAR_TRACE( "VirtualFreeEx(%p, %p, %#Ix, %#lx)\n", process, addr, size, type );
+     return set_ntstatus( NtFreeVirtualMemory( process, &addr, &size, type ));
+ }
+ 
+@@ -566,7 +852,13 @@ BOOL WINAPI DECLSPEC_HOTPATCH VirtualProtectEx( HANDLE process, void *addr, SIZE
+ 
+     /* Win9x allows passing NULL as old_prot while this fails on NT */
+     if (!old_prot && (GetVersion() & 0x80000000)) old_prot = &prot;
+-    return set_ntstatus( NtProtectVirtualMemory( process, &addr, &size, new_prot, old_prot ));
++    {
++        NTSTATUS status = NtProtectVirtualMemory( process, &addr, &size, new_prot, old_prot );
++
++        NEAR_TRACE( "VirtualProtectEx(%p, %p, %#Ix, %#lx) -> old %#lx status %#lx\n",
++                    process, addr, size, new_prot, old_prot && !status ? *old_prot : 0, status );
++        return set_ntstatus( status );
++    }
+ }
+ 
+ /***********************************************************************
+@@ -597,7 +889,13 @@ SIZE_T WINAPI DECLSPEC_HOTPATCH VirtualQueryEx( HANDLE process, LPCVOID addr,
+     SIZE_T ret;
+ 
+     if (!set_ntstatus( NtQueryVirtualMemory( process, addr, MemoryBasicInformation, info, len, &ret )))
++    {
++        NEAR_TRACE( "VirtualQueryEx(%p, %p) failed %lu\n", process, addr, GetLastError() );
+         return 0;
++    }
++    NEAR_TRACE( "VirtualQueryEx(%p, %p) -> base %p alloc %p size %#Ix state %#lx protect %#lx allocprot %#lx type %#lx\n",
++                process, addr, info->BaseAddress, info->AllocationBase, info->RegionSize,
++                info->State, info->Protect, info->AllocationProtect, info->Type );
+     return ret;
+ }
+ 
+@@ -611,6 +909,38 @@ BOOL WINAPI DECLSPEC_HOTPATCH VirtualUnlock( void *addr, SIZE_T size )
+ }
+ 
+ 
++/* iOS-Madeira: NtWriteVirtualMemory goes through the wineserver, whose
++ * write_process_memory cannot make an executable page writable on iOS and
++ * fails with STATUS_ACCESS_DENIED -- Minecraft Dungeons' winmm.dll writes its
++ * hook trampoline (5 bytes into an executable page it just allocated) that
++ * way and gives up on the error. In the calling process the page is mapped
++ * right here, so copy directly; a fault falls back to the server path. */
++static NTSTATUS write_own_memory( HANDLE process, void *addr, const void *buffer,
++                                  SIZE_T size, SIZE_T *bytes_written )
++{
++    if (process == GetCurrentProcess() || GetProcessId( process ) == GetCurrentProcessId())
++    {
++        BOOL ok = TRUE;
++        __TRY
++        {
++            memcpy( addr, buffer, size );
++        }
++        __EXCEPT_PAGE_FAULT
++        {
++            ok = FALSE;
++        }
++        __ENDTRY
++        if (ok)
++        {
++            NEAR_TRACE( "WriteProcessMemory: %#Ix bytes copied directly to %p\n", size, addr );
++            if (bytes_written) *bytes_written = size;
++            return STATUS_SUCCESS;
++        }
++        NEAR_TRACE( "WriteProcessMemory: direct copy to %p faulted, using the server\n", addr );
++    }
++    return NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
++}
++
+ /***********************************************************************
+  *             WriteProcessMemory    (kernelbase.@)
+  */
+@@ -624,6 +954,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH WriteProcessMemory( HANDLE process, void *addr, co
+     SIZE_T region_size;
+     NTSTATUS status, status2;
+ 
++    NEAR_TRACE( "WriteProcessMemory(%p, %p, %#Ix)\n", process, addr, size );
+     if (!VirtualQueryEx( process, addr, &info, sizeof(info) ))
+     {
+         close_cross_process_connection( list );
+@@ -637,7 +968,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH WriteProcessMemory( HANDLE process, void *addr, co
+     case PAGE_EXECUTE_READWRITE:
+     case PAGE_EXECUTE_WRITECOPY:
+         /* already writable */
+-        if ((status = NtWriteVirtualMemory( process, addr, buffer, size, bytes_written ))) break;
++        if ((status = write_own_memory( process, addr, buffer, size, bytes_written ))) break;
+         send_cross_process_notification( list, CrossProcessFlushCache, addr, size, 0 );
+         NtFlushInstructionCache( process, addr, size );
+         break;
+@@ -657,7 +988,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH WriteProcessMemory( HANDLE process, void *addr, co
+                                          base_addr, region_size, 2, prot, status );
+         if (status) break;
+ 
+-        status = NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
++        status = write_own_memory( process, addr, buffer, size, bytes_written );
+         if (!status)
+         {
+             send_cross_process_notification( list, CrossProcessFlushCache, addr, size, 0 );
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 451c852..9cfc9e4 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -1285,6 +1285,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetProcessWorkingSetSizeEx( HANDLE process, SIZE_T
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH TerminateProcess( HANDLE handle, DWORD exit_code )
+ {
++    near_hint_dump( "TerminateProcess" );
+     if (!handle)
+     {
+         SetLastError( ERROR_INVALID_HANDLE );

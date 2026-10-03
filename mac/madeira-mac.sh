@@ -271,7 +271,8 @@ fex-pe)
         -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_LTO=OFF \
         -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON -DENABLE_OFFLINE_RUNTIME=ON \
         -DBUILD_FEXCONFIG=ON -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=OFF \
-        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_ASSERTIONS=OFF
+        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_ASSERTIONS=OFF \
+        -DTUNE_ARCH=generic -DTUNE_CPU=none   # TUNE_CPU=native liest /proc/cpuinfo (gibt es auf macOS nicht)
     cmake --build FEX/build-arm64ec --target arm64ecfex -j"$JOBS"
     cp FEX/build-arm64ec/Bin/libarm64ecfex.dll app/Madeira/arm64ec-windows/xtajit64.dll
     ls -la app/Madeira/arm64ec-windows/xtajit64.dll

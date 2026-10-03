@@ -322,6 +322,27 @@ app)
             grep -v "warning" xcodebuild.log | tail -25; exit 1; }
     APP=app/build/Debug-iphoneos/Madeira.app
     test -d "$APP"
+    # Ohne Signatur bettet Xcode keine Entitlements ein, und Feather/SideStore übernehmen beim
+    # Neusignieren die aus der Binary: ohne increased-memory-limit endet der Adressraum bei
+    # 0x7180000000 und die Cage-Reservierung ab 0x7200000000 scheitert (errno 12).
+    # Ad-hoc signieren mit denselben Entitlements wie die Release-Binary.
+    cat > /tmp/madeira.entitlements <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+    find "$APP" \( -name '*.dylib' -o -name '*.framework' \) -prune -print | while read -r c; do
+        codesign -f -s - "$c" >/dev/null 2>&1 || echo "WARNUNG: konnte $c nicht ad-hoc signieren"
+    done
+    codesign -f -s - --entitlements /tmp/madeira.entitlements "$APP"
+    codesign -d --entitlements - "$APP" 2>/dev/null | grep -E "increased-memory|get-task" || { echo "Entitlements fehlen"; exit 1; }
     rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
     zip -qr "Madeira-${MADEIRA_TAG:-dev}-app.ipa" Payload
     ls -la ./*.ipa
